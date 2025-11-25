@@ -449,6 +449,130 @@ GROUP BY event_date;
 
 ---
 
+### 3.6. UNION vs UNION ALL
+
+중복 제거가 필요 없는 경우 **UNION ALL**을 사용하면 비용을 크게 절감할 수 있다.  
+UNION은 중복 제거를 수행하므로 비용이 높다.
+
+#### Bad ❌
+
+```sql
+-- UNION은 중복 제거를 수행하므로 비용 높음
+SELECT symbol_id, date, close
+FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily`
+WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  AND symbol_id = 'KR_005930'
+UNION
+SELECT symbol_id, date, close
+FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily_backup`
+WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  AND symbol_id = 'KR_005930';
+```
+
+#### Good ✅
+
+```sql
+-- UNION ALL은 중복 제거를 하지 않아 훨씬 효율적
+SELECT symbol_id, date, close
+FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily`
+WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  AND symbol_id = 'KR_005930'
+UNION ALL
+SELECT symbol_id, date, close
+FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily_backup`
+WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  AND symbol_id = 'KR_005930';
+```
+
+> **규칙:** 중복 제거가 정말 필요한 경우에만 UNION을 사용하고,  
+> 그 외에는 항상 UNION ALL을 사용한다.
+
+---
+
+### 3.7. EXISTS vs IN
+
+서브쿼리에서 **EXISTS**가 **IN**보다 일반적으로 더 효율적이다.  
+특히 서브쿼리가 큰 경우 EXISTS가 더 빠르게 실행된다.
+
+#### Bad ❌
+
+```sql
+-- IN은 서브쿼리 결과를 모두 메모리에 로드
+SELECT symbol_id, date, close
+FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily`
+WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  AND symbol_id IN (
+    SELECT symbol_id
+    FROM `{{PROJECT_ID}}.{{DATASET}}.signal_history`
+    WHERE generated_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+      AND signal_type = 'STRONG_BUY'
+  );
+```
+
+#### Good ✅
+
+```sql
+-- EXISTS는 첫 번째 매칭을 찾으면 즉시 중단 (더 효율적)
+SELECT symbol_id, date, close
+FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily` p
+WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  AND EXISTS (
+    SELECT 1
+    FROM `{{PROJECT_ID}}.{{DATASET}}.signal_history` s
+    WHERE s.symbol_id = p.symbol_id
+      AND s.generated_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+      AND s.signal_type = 'STRONG_BUY'
+  );
+```
+
+> **규칙:** 서브쿼리를 사용할 때는 가능한 한 EXISTS를 사용한다.  
+> 단, 서브쿼리 결과가 매우 작은 경우(예: 10개 이하) IN도 괜찮다.
+
+---
+
+### 3.8. 배열 언네스팅 최적화
+
+GA4처럼 배열/구조체를 언네스팅할 때는 **필터를 먼저 적용**한 후 UNNEST를 수행하는 것이 효율적이다.
+
+#### Bad ❌
+
+```sql
+-- UNNEST 후 필터링 (비효율적)
+SELECT
+  event_date,
+  traffic_source.source AS source,
+  COUNT(*) AS sessions
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`,
+UNNEST(traffic_source) AS traffic_source
+WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+                        AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+  AND event_name = 'session_start'
+  AND traffic_source.source = 'google'  -- UNNEST 후 필터링
+GROUP BY event_date, source;
+```
+
+#### Good ✅
+
+```sql
+-- 필터링 후 UNNEST (효율적)
+SELECT
+  event_date,
+  traffic_source.source AS source,
+  COUNT(*) AS sessions
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`,
+UNNEST(traffic_source) AS traffic_source
+WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+                        AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+  AND event_name = 'session_start'
+  AND traffic_source.source = 'google'  -- 가능한 한 빨리 필터링
+GROUP BY event_date, source;
+```
+
+> **팁:** UNNEST는 가능한 한 필요한 행에만 적용하고,  
+> 날짜 필터와 이벤트 필터를 먼저 적용한 후 UNNEST를 수행한다.
+
+---
+
 ## 4. GA4 전용 쿼리 베스트 프랙티스
 
 ### 4.1. 최근 7일 채널별 세션
@@ -722,6 +846,36 @@ ORDER BY event_timestamp
 LIMIT 1000;
 ```
 
+### 7.5. 불필요한 UNION 사용
+
+중복 제거가 필요 없는 경우 UNION 대신 UNION ALL을 사용해야 한다.
+
+```sql
+-- ❌ 비용 높음 (중복 제거 수행)
+SELECT symbol_id FROM table1
+UNION
+SELECT symbol_id FROM table2;
+
+-- ✅ 비용 절감 (중복 제거 없음)
+SELECT symbol_id FROM table1
+UNION ALL
+SELECT symbol_id FROM table2;
+```
+
+### 7.6. 비효율적인 IN 서브쿼리
+
+서브쿼리에서 IN 대신 EXISTS를 사용하는 것이 일반적으로 더 효율적이다.
+
+```sql
+-- ❌ 비효율적 (서브쿼리 결과를 모두 메모리에 로드)
+SELECT * FROM prices_daily
+WHERE symbol_id IN (SELECT symbol_id FROM signal_history WHERE ...);
+
+-- ✅ 효율적 (첫 매칭 발견 시 중단)
+SELECT * FROM prices_daily p
+WHERE EXISTS (SELECT 1 FROM signal_history s WHERE s.symbol_id = p.symbol_id AND ...);
+```
+
 ---
 
 ## 8. 쿼리 비용 확인 및 모니터링
@@ -796,6 +950,9 @@ Claude가 BigQuery 쿼리를 생성할 때, 아래 체크리스트를 스스로 
 - [ ] APPROX 함수를 사용할 수 있는 경우인가? (대시보드/탐색적 분석)
 - [ ] 서브쿼리를 CTE로 변환하여 가독성과 성능을 개선했는가?
 - [ ] 윈도우 함수의 PARTITION BY가 클러스터 컬럼과 일치하는가?
+- [ ] UNION 대신 UNION ALL을 사용할 수 있는가? (중복 제거 불필요 시)
+- [ ] 서브쿼리에서 IN 대신 EXISTS를 사용할 수 있는가?
+- [ ] 배열 언네스팅 시 필터를 먼저 적용했는가?
 
 ### 고급 최적화
 - [ ] 필요 시 머터리얼라이즈드 뷰/파생 테이블 사용을 제안했는가?
