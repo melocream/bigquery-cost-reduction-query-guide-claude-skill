@@ -13,6 +13,21 @@ description: >
 
 ---
 
+## 목차
+
+- [0. 이 스킬을 어떻게 사용할 것인가? (Claude에게)](#0-이-스킬을-어떻게-사용할-것인가-claude에게)
+- [1. 테이블 설계 레벨의 베스트 프랙티스](#1-테이블-설계-레벨의-베스트-프랙티스)
+- [2. 쿼리 작성 공통 규칙](#2-쿼리-작성-공통-규칙)
+- [3. 고급 최적화 기법](#3-고급-최적화-기법)
+- [4. GA4 전용 쿼리 베스트 프랙티스](#4-ga4-전용-쿼리-베스트-프랙티스)
+- [5. StockAI 전용 쿼리 베스트 프랙티스](#5-stockai-전용-쿼리-베스트-프랙티스)
+- [6. 대시보드/리포트용 쿼리 패턴](#6-대시보드리포트용-쿼리-패턴)
+- [7. 안티 패턴 (피해야 할 쿼리 형태)](#7-안티-패턴-피해야-할-쿼리-형태)
+- [8. 쿼리 비용 확인 및 모니터링](#8-쿼리-비용-확인-및-모니터링)
+- [9. Claude 체크리스트 (스킬 사용 시)](#9-claude-체크리스트-스킬-사용-시)
+
+---
+
 ## 0. 이 스킬을 어떻게 사용할 것인가? (Claude에게)
 
 Claude가 **BigQuery 쿼리를 작성/수정할 때** 반드시 아래를 지켜야 한다.
@@ -22,12 +37,14 @@ Claude가 **BigQuery 쿼리를 작성/수정할 때** 반드시 아래를 지켜
 3. `symbol_id`, `event_name`, `traffic_source`, `country` 등  
    **카디널리티를 줄일 수 있는 WHERE 조건**을 적극적으로 사용한다.
 4. 범용 쿼리를 만들 때도  
-   - “비용 절감 포인트”를 주석으로 달아서 안내한다.
-   - 사용자가 명시적으로 “대략적인 비용 상관없다”고 말하지 않는 이상  
+   - "비용 절감 포인트"를 주석으로 달아서 안내한다.
+   - 사용자가 명시적으로 "대략적인 비용 상관없다"고 말하지 않는 이상  
      항상 비용을 최소화하는 방향으로 설계한다.
 5. GA4, StockAI처럼 **시계열 테이블**에 대해서는
    - 파티션 키(예: `date`, `event_date`) 기준으로  
      **최근 7~90일 이내로 기본 예시를 제시**한다.
+6. **LIMIT 절을 적극 활용**하여 불필요한 데이터 전송을 방지한다.
+7. **APPROX 함수**를 사용하여 정확도와 비용의 트레이드오프를 고려한다.
 
 ---
 
@@ -63,7 +80,7 @@ CREATE TABLE `{{PROJECT_ID}}.{{DATASET}}.prices_daily` (
 )
 PARTITION BY date
 CLUSTER BY symbol_id;
-````
+```
 
 #### 예시: GA4 이벤트 집계용 테이블
 
@@ -88,21 +105,49 @@ CLUSTER BY event_name, traffic_source;
 
 ### 1.2. 클러스터링(Clustering) 기본 전략
 
-* StockAI:
-
-  * `CLUSTER BY symbol_id`
-* GA4:
-
-  * `CLUSTER BY event_name`, `traffic_source`, `country` 등 자주 필터/그룹되는 컬럼
+- **StockAI:**
+  - `CLUSTER BY symbol_id`
+- **GA4:**
+  - `CLUSTER BY event_name`, `traffic_source`, `country` 등 자주 필터/그룹되는 컬럼
 
 **규칙:** 쿼리 예시를 제시할 때
 → 클러스터 컬럼에 WHERE/GROUP BY를 자연스럽게 얹어 비용 절감을 유도한다.
 
 ---
 
+### 1.3. 머터리얼라이즈드 뷰 활용
+
+반복적으로 사용되는 집계 쿼리는 **머터리얼라이즈드 뷰**로 생성하여 비용을 절감한다.
+
+```sql
+-- 예시: 일별 채널별 세션 집계를 머터리얼라이즈드 뷰로 생성
+CREATE MATERIALIZED VIEW `{{PROJECT_ID}}.{{DATASET}}.mv_daily_sessions_by_channel`
+PARTITION BY event_date
+CLUSTER BY traffic_source
+AS
+SELECT
+  event_date,
+  traffic_source.source AS source,
+  COUNT(*) AS sessions
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`,
+UNNEST(traffic_source) AS traffic_source
+WHERE event_name = 'session_start'
+GROUP BY event_date, source;
+
+-- 이후 쿼리는 훨씬 저렴하게 실행됨
+SELECT *
+FROM `{{PROJECT_ID}}.{{DATASET}}.mv_daily_sessions_by_channel`
+WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY);
+```
+
+> **주의:** 머터리얼라이즈드 뷰는 자동으로 최신 데이터를 반영하지만,  
+> 스토리지 비용이 발생하므로 사용 빈도가 높은 쿼리에만 적용한다.
+
+---
+
 ## 2. 쿼리 작성 공통 규칙
 
-### 2.1. 날짜 필터는 “무조건” 넣는다
+### 2.1. 날짜 필터는 "무조건" 넣는다
 
 **항상** 파티션 컬럼으로 범위를 자른다.
 
@@ -140,7 +185,7 @@ ORDER BY event_date;
 
 > Claude는 사용자가 날짜 범위를 지정하지 않으면
 > **기본적으로 최근 7~30일 예시를 제안**하고,
-> “전체 기간은 비용이 커질 수 있다”는 주석을 달아야 한다.
+> "전체 기간은 비용이 커질 수 있다"는 주석을 달아야 한다.
 
 ---
 
@@ -167,7 +212,7 @@ WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250107'
 ```
 
 > Claude는 쿼리 예시를 만들 때 **항상 컬럼을 명시적으로 지정**해야 하며,
-> 사용자가 “정말로 모든 컬럼을 보고 싶다”고 명시하지 않는 이상 `SELECT *`을 제안하지 않는다.
+> 사용자가 "정말로 모든 컬럼을 보고 싶다"고 명시하지 않는 이상 `SELECT *`을 제안하지 않는다.
 
 ---
 
@@ -231,9 +276,182 @@ WHERE p.date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
 
 ---
 
-## 3. GA4 전용 쿼리 베스트 프랙티스
+### 2.5. LIMIT 절 적극 활용
 
-### 3.1. 최근 7일 채널별 세션
+대시보드나 탐색적 분석 시 **LIMIT 절을 항상 사용**하여 불필요한 데이터 전송을 방지한다.
+
+#### Good ✅
+
+```sql
+-- 최근 상위 10개 종목만 조회
+SELECT
+  symbol_id,
+  date,
+  close,
+  volume
+FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily`
+WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+ORDER BY volume DESC
+LIMIT 10;
+```
+
+```sql
+-- 샘플 데이터 확인용
+SELECT *
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
+WHERE _TABLE_SUFFIX = FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+  AND event_name = 'purchase'
+LIMIT 100;
+```
+
+---
+
+## 3. 고급 최적화 기법
+
+### 3.1. APPROX 함수 활용 (정확도 vs 비용 트레이드오프)
+
+대용량 데이터에서 **근사치로 충분한 경우** APPROX 함수를 사용하면 비용을 크게 절감할 수 있다.
+
+```sql
+-- 정확한 COUNT DISTINCT (비용 높음)
+SELECT
+  event_date,
+  COUNT(DISTINCT user_pseudo_id) AS exact_dau
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
+WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY))
+                        AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+GROUP BY event_date;
+
+-- 근사치 COUNT DISTINCT (비용 낮음, 오차율 ~1%)
+SELECT
+  event_date,
+  APPROX_COUNT_DISTINCT(user_pseudo_id) AS approx_dau
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
+WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY))
+                        AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+GROUP BY event_date;
+```
+
+> **사용 가이드:**
+> - 대시보드/리포트: APPROX 함수 사용 권장 (오차율 1% 이내)
+> - 정확한 계산이 필요한 경우: 일반 함수 사용
+> - 데이터 탐색 단계: 항상 APPROX 함수 사용
+
+---
+
+### 3.2. 테이블 샘플링 (TABLESAMPLE)
+
+대용량 테이블에서 **빠른 탐색**이 필요할 때 샘플링을 사용한다.
+
+```sql
+-- 10% 샘플링 (비용 1/10로 감소)
+SELECT
+  event_date,
+  event_name,
+  COUNT(*) AS event_count
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
+TABLESAMPLE SYSTEM (10 PERCENT)
+WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+                        AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+GROUP BY event_date, event_name
+ORDER BY event_count DESC;
+```
+
+> **주의:** 샘플링은 통계적 분석에는 유용하지만,  
+> 정확한 집계가 필요한 경우 사용하지 않는다.
+
+---
+
+### 3.3. 서브쿼리 최적화
+
+서브쿼리는 가능한 한 **CTE(Common Table Expression)**로 변환하고,  
+각 서브쿼리에도 날짜 필터를 적용한다.
+
+#### Bad ❌
+
+```sql
+SELECT *
+FROM (
+  SELECT symbol_id, date, close
+  FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily`
+) p
+WHERE p.close > (
+  SELECT AVG(close)
+  FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily`
+);
+```
+
+#### Good ✅
+
+```sql
+WITH avg_prices AS (
+  SELECT AVG(close) AS avg_close
+  FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily`
+  WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
+),
+recent_prices AS (
+  SELECT symbol_id, date, close
+  FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily`
+  WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+)
+SELECT r.symbol_id, r.date, r.close, a.avg_close
+FROM recent_prices r
+CROSS JOIN avg_prices a
+WHERE r.close > a.avg_close
+ORDER BY r.date;
+```
+
+---
+
+### 3.4. 윈도우 함수 최적화
+
+윈도우 함수 사용 시 **PARTITION BY와 ORDER BY 컬럼을 클러스터 컬럼과 일치**시켜 비용을 절감한다.
+
+#### Good ✅
+
+```sql
+-- symbol_id로 클러스터링된 테이블에서 윈도우 함수 사용
+SELECT
+  symbol_id,
+  date,
+  close,
+  AVG(close) OVER (
+    PARTITION BY symbol_id
+    ORDER BY date
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ) AS ma_7d
+FROM `{{PROJECT_ID}}.{{DATASET}}.prices_daily`
+WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 180 DAY)
+  AND symbol_id IN ('KR_005930', 'US_AAPL')
+ORDER BY symbol_id, date;
+```
+
+---
+
+### 3.5. 쿼리 결과 캐싱 활용
+
+BigQuery는 **24시간 동안 동일한 쿼리 결과를 캐시**한다.  
+반복 실행되는 쿼리는 자동으로 캐시를 활용하므로 비용이 발생하지 않는다.
+
+```sql
+-- 동일한 쿼리를 24시간 내에 재실행하면 비용 없음
+SELECT
+  event_date,
+  COUNT(*) AS pageviews
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
+WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+                        AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+  AND event_name = 'page_view'
+GROUP BY event_date;
+```
+
+> **팁:** 대시보드 쿼리는 가능한 한 동일한 형태로 유지하여 캐싱 효과를 극대화한다.
+
+---
+
+## 4. GA4 전용 쿼리 베스트 프랙티스
+
+### 4.1. 최근 7일 채널별 세션
 
 ```sql
 -- 비용 절감 포인트:
@@ -254,7 +472,9 @@ GROUP BY event_date, source
 ORDER BY event_date, sessions DESC;
 ```
 
-### 3.2. 최근 30일 UTM 기준 전환 수
+---
+
+### 4.2. 최근 30일 UTM 기준 전환 수
 
 ```sql
 -- utm_source / utm_medium / utm_campaign에 대한 집계 예시
@@ -289,15 +509,26 @@ ORDER BY event_date, conversions DESC;
 
 ---
 
-### 3.3. 사용자 레벨 분석 시 주의점
+### 4.3. 사용자 레벨 분석 시 주의점
 
-* user_pseudo_id 기준 DISTINCT COUNT는 데이터량이 크므로
+- `user_pseudo_id` 기준 DISTINCT COUNT는 데이터량이 크므로
   **반드시 날짜 범위 제한 + 필요 컬럼 최소화**를 한다.
 
 ```sql
+-- 정확한 DAU (비용 높음)
 SELECT
   event_date,
   COUNT(DISTINCT user_pseudo_id) AS dau
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
+WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY))
+                        AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+GROUP BY event_date
+ORDER BY event_date;
+
+-- 근사치 DAU (비용 낮음, 대시보드용 권장)
+SELECT
+  event_date,
+  APPROX_COUNT_DISTINCT(user_pseudo_id) AS approx_dau
 FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
 WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY))
                         AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
@@ -307,9 +538,9 @@ ORDER BY event_date;
 
 ---
 
-## 4. StockAI 전용 쿼리 베스트 프랙티스
+## 5. StockAI 전용 쿼리 베스트 프랙티스
 
-### 4.1. 특정 종목 최근 6개월 차트 데이터
+### 5.1. 특정 종목 최근 6개월 차트 데이터
 
 ```sql
 -- StockAI: 차트/기술분석용 기본 쿼리
@@ -326,7 +557,9 @@ WHERE symbol_id = 'KR_005930'
 ORDER BY date;
 ```
 
-### 4.2. 기술지표 + 가격 + 시그널 JOIN
+---
+
+### 5.2. 기술지표 + 가격 + 시그널 JOIN
 
 ```sql
 -- 뉴스 기반 시그널 검증용 쿼리
@@ -368,7 +601,7 @@ ORDER BY b.generated_date;
 
 ---
 
-### 4.3. 백테스트 라벨 생성 (예: 10거래일 수익률)
+### 5.3. 백테스트 라벨 생성 (예: 10거래일 수익률)
 
 ```sql
 -- 백테스트/ML용 수익률 라벨 생성 예시
@@ -403,9 +636,9 @@ WHERE close_after_10d IS NOT NULL;
 
 ---
 
-## 5. 대시보드/리포트용 쿼리 패턴
+## 6. 대시보드/리포트용 쿼리 패턴
 
-### 5.1. GA4 – 최근 30일 기기별 트래픽 & 전환
+### 6.1. GA4 – 최근 30일 기기별 트래픽 & 전환
 
 ```sql
 SELECT
@@ -421,7 +654,9 @@ GROUP BY event_date, device_category
 ORDER BY event_date, device_category;
 ```
 
-### 5.2. StockAI – 최근 7일 종목별 시그널 요약
+---
+
+### 6.2. StockAI – 최근 7일 종목별 시그널 요약
 
 ```sql
 SELECT
@@ -440,46 +675,140 @@ LIMIT 50;
 
 ---
 
-## 6. 안티 패턴 (피해야 할 쿼리 형태)
+## 7. 안티 패턴 (피해야 할 쿼리 형태)
 
 Claude는 아래 형태의 쿼리를 **가능한 한 제안하지 않거나,
 비용 경고를 함께 붙여야 한다.**
 
-1. 날짜 조건 없이 전체 테이블 스캔
+### 7.1. 날짜 조건 없이 전체 테이블 스캔
 
-   ```sql
-   SELECT *
-   FROM `dataset.events_*`;  -- ❌
-   ```
+```sql
+SELECT *
+FROM `dataset.events_*`;  -- ❌
+```
 
-2. 분석/ML용으로 `SELECT *` + JOIN + 전체기간
+### 7.2. 분석/ML용으로 `SELECT *` + JOIN + 전체기간
 
-   ```sql
-   SELECT *
-   FROM prices_daily p
-   JOIN technical_daily t
-     ON p.symbol_id = t.symbol_id
-    AND p.date = t.date;     -- ❌
-   ```
+```sql
+SELECT *
+FROM prices_daily p
+JOIN technical_daily t
+  ON p.symbol_id = t.symbol_id
+ AND p.date = t.date;     -- ❌
+```
 
-3. 고카디널리티 컬럼(예: full URL, user_id)에 대해 전체기간 DISTINCT COUNT
-   → 반드시 날짜+조건으로 범위 줄이기.
+### 7.3. 고카디널리티 컬럼에 대한 전체기간 DISTINCT COUNT
+
+고카디널리티 컬럼(예: full URL, user_id)에 대해 전체기간 DISTINCT COUNT를 수행하는 경우  
+→ 반드시 날짜+조건으로 범위 줄이기.
+
+### 7.4. 불필요한 ORDER BY
+
+대용량 결과에 대해 ORDER BY를 사용하면 비용이 증가한다.  
+→ LIMIT과 함께 사용하거나, 클라이언트 측에서 정렬하는 것을 고려.
+
+```sql
+-- ❌ 비용 높음
+SELECT *
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+ORDER BY event_timestamp;
+
+-- ✅ 비용 절감
+SELECT *
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+ORDER BY event_timestamp
+LIMIT 1000;
+```
 
 ---
 
-## 7. Claude 체크리스트 (스킬 사용 시)
+## 8. 쿼리 비용 확인 및 모니터링
+
+### 8.1. 쿼리 실행 전 비용 예측
+
+BigQuery 콘솔에서 쿼리를 실행하기 전 **"Validated" 단계에서 스캔될 데이터 양을 확인**할 수 있다.
+
+> **팁:** 쿼리 실행 전 항상 "This query will process X GB" 메시지를 확인한다.
+
+### 8.2. 쿼리 실행 계획 확인
+
+```sql
+-- EXPLAIN을 사용하여 쿼리 실행 계획 확인
+EXPLAIN
+SELECT
+  event_date,
+  COUNT(*) AS pageviews
+FROM `{{PROJECT_ID}}.{{DATASET}}.events_*`
+WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+                        AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+  AND event_name = 'page_view'
+GROUP BY event_date;
+```
+
+### 8.3. INFORMATION_SCHEMA를 통한 쿼리 히스토리 확인
+
+```sql
+-- 최근 실행된 쿼리의 비용 확인
+SELECT
+  job_id,
+  creation_time,
+  total_bytes_processed,
+  total_bytes_processed / POW(1024, 3) AS total_gb_processed,
+  total_slot_ms,
+  query
+FROM `region-us.INFORMATION_SCHEMA.JOBS_BY_PROJECT`
+WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+  AND total_bytes_processed > 0
+ORDER BY total_bytes_processed DESC
+LIMIT 10;
+```
+
+### 8.4. 비용 절감 팁 요약
+
+1. **파티션 프루닝:** 날짜 필터로 스캔 범위 최소화
+2. **컬럼 선택:** 필요한 컬럼만 선택하여 스캔 데이터 감소
+3. **클러스터 활용:** 클러스터 컬럼으로 필터링
+4. **LIMIT 사용:** 결과 크기 제한
+5. **APPROX 함수:** 근사치로 충분한 경우 사용
+6. **캐싱 활용:** 동일 쿼리 재실행 시 비용 없음
+7. **머터리얼라이즈드 뷰:** 반복 집계 쿼리 최적화
+
+---
+
+## 9. Claude 체크리스트 (스킬 사용 시)
 
 Claude가 BigQuery 쿼리를 생성할 때, 아래 체크리스트를 스스로 점검해야 한다.
 
-* [ ] 파티션 컬럼(날짜/시간)에 필터가 있는가?
-* [ ] `SELECT *`를 사용하지 않았는가?
-* [ ] 심볼/이벤트명/채널 등 카디널리티를 줄이는 WHERE 조건을 사용했는가?
-* [ ] JOIN 시 양쪽 모두에 날짜 조건이 적용되어 있는가?
-* [ ] 대시보드/리포트용이면 최근 기간(7~90일)으로 제한했는가?
-* [ ] ML/백테스트용이면 period를 명시하고, 필요 최소 범위로 제한했는가?
-* [ ] 필요 시 머터리얼라이즈드 뷰/파생 테이블 사용을 제안했는가?
+### 기본 규칙
+- [ ] 파티션 컬럼(날짜/시간)에 필터가 있는가?
+- [ ] `SELECT *`를 사용하지 않았는가?
+- [ ] 심볼/이벤트명/채널 등 카디널리티를 줄이는 WHERE 조건을 사용했는가?
+- [ ] JOIN 시 양쪽 모두에 날짜 조건이 적용되어 있는가?
+
+### 기간 제한
+- [ ] 대시보드/리포트용이면 최근 기간(7~90일)으로 제한했는가?
+- [ ] ML/백테스트용이면 period를 명시하고, 필요 최소 범위로 제한했는가?
+
+### 최적화 기법
+- [ ] LIMIT 절을 적절히 사용했는가?
+- [ ] APPROX 함수를 사용할 수 있는 경우인가? (대시보드/탐색적 분석)
+- [ ] 서브쿼리를 CTE로 변환하여 가독성과 성능을 개선했는가?
+- [ ] 윈도우 함수의 PARTITION BY가 클러스터 컬럼과 일치하는가?
+
+### 고급 최적화
+- [ ] 필요 시 머터리얼라이즈드 뷰/파생 테이블 사용을 제안했는가?
+- [ ] 테이블 샘플링을 사용할 수 있는 경우인가? (탐색적 분석)
+- [ ] 쿼리 결과 캐싱을 활용할 수 있는 구조인가?
+
+### 비용 경고
+- [ ] 비용이 높을 수 있는 쿼리에는 경고 주석을 추가했는가?
+- [ ] 사용자에게 비용 절감 포인트를 명시했는가?
+
+---
 
 이 스킬은 **GA4 마케팅 분석**과 **StockAI 주식/뉴스 플랫폼** 모두에서
 BigQuery 쿼리 작성 시 기본 가이드라인으로 사용해야 한다.
 
-
+````
